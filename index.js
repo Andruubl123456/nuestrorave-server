@@ -23,6 +23,24 @@ const io     = new Server(server, {
 // ─────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
+const { createProxyMiddleware } = require('http-proxy-middleware');
+
+// Este es el túnel que "engaña" a los sitios de películas
+app.use('/proxy', createProxyMiddleware({
+    router: (req) => new URL(req.query.url).origin,
+    pathRewrite: (path, req) => new URL(req.query.url).pathname + new URL(req.query.url).search,
+    changeOrigin: true,
+    followRedirects: true,
+    onProxyRes: function (proxyRes, req, res) {
+        // AQUÍ ESTÁ LA MAGIA: Borramos lo que bloquea el iframe
+        delete proxyRes.headers['x-frame-options'];
+        delete proxyRes.headers['content-security-policy'];
+        
+        // Permitimos que tu app lea el contenido
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+    }
+}));
 
 // ─────────────────────────────
 // 3. SEARCH MODULE
