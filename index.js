@@ -1,12 +1,22 @@
 /**
- * NuestroRave — Servidor FINAL (v1 + v3 combinados)
- * ──────────────────────────────────────────────────
- * Del v1: estructura simple db.users + db.room, socketUsers map,
- *         endpoints /register y /login directos.
- * Del v3: Heartbeat + Catch-up, busqueda YouTube API v3,
- *         sync-position al unirse, transfer-host,
- *         Garbage Collection, photoMap.
+ * NuestroRave — Servidor FINAL (v1 + v3 + Nuevas Funciones)
+ * ──────────────────────────────────────────────────────────
+ * NUEVO: Búsqueda Google Programmable Search (requiere search.js)
+ * NUEVO: Chat con imágenes (chat-image)
+ * NUEVO: Reacciones a mensajes (react-message / message-reaction)
+ * NUEVO: dotenv para variables de entorno
  */
+
+// Endpoint para obtener configuración de Google API
+app.get('/api/config', (req, res) => {
+  res.json({
+    googleApiKey: process.env.GOOGLE_API_KEY,
+    googleCxId: process.env.GOOGLE_CX_ID
+  });
+});
+
+// ... resto del código del servidor
+try { require('dotenv').config(); } catch(e) { /* dotenv opcional */ }
 
 const express = require('express');
 const http    = require('http');
@@ -19,8 +29,17 @@ const io     = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
 });
 
+// ── Módulo de búsqueda Google (opcional — requiere search.js) ──
+let searchGoogle, searchYouTubeGoogle;
+try {
+  ({ searchGoogle, searchYouTubeGoogle } = require('./search'));
+  console.log('[SEARCH] Módulo Google Search cargado ✓');
+} catch(e) {
+  console.warn('[SEARCH] search.js no encontrado — búsqueda Google desactivada');
+}
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Aumentado para imágenes en base64
 
 // ══════════════════════════════════════════════
 //  CONSTANTES DE SINCRONIZACION
@@ -34,14 +53,13 @@ const SYNC = {
 
 // ══════════════════════════════════════════════
 //  BASE DE DATOS EN MEMORIA
-//  Estructura del v1 + campos extra del v3
 // ══════════════════════════════════════════════
 const db = {
   users: {},
   room: {
     onlineUsers    : [],
-    socketMap      : {},   // v3: username -> socketId
-    photoMap       : {},   // v3: username -> foto base64
+    socketMap      : {},
+    photoMap       : {},
     queue          : [],
     currentMedia   : null,
     isPlaying      : false,
@@ -62,7 +80,6 @@ const db = {
   },
 };
 
-// socketId -> username (del v1)
 const socketUsers = {};
 
 // ══════════════════════════════════════════════
@@ -115,7 +132,7 @@ function cancelGC() {
 }
 
 // ══════════════════════════════════════════════
-//  YOUTUBE SEARCH (del v3 - requiere YT_API_KEY)
+//  YOUTUBE SEARCH (requiere YT_API_KEY en .env)
 // ══════════════════════════════════════════════
 const YT_API_KEY = process.env.YT_API_KEY || '';
 
@@ -159,13 +176,32 @@ app.post('/login', (req, res) => {
   res.json({ ok: true, roomState: roomPublicState() });
 });
 
+// ── NUEVO: Búsqueda Google Programmable Search ─────────────
+// Requiere: server/search.js + GOOGLE_API_KEY + SEARCH_ENGINE_ID en .env
+app.post('/search', async (req, res) => {
+  if (!searchGoogle) {
+    return res.json({ ok: false, error: 'Módulo de búsqueda no configurado. Crea server/search.js y configura .env' });
+  }
+  const { query, type = 'video' } = req.body || {};
+  if (!query) return res.json({ ok: false, error: 'Query vacío' });
+  try {
+    const results = type === 'youtube'
+      ? await searchYouTubeGoogle(query)
+      : await searchGoogle(query, type);
+    res.json({ ok: true, results });
+  } catch (e) {
+    console.error('[SEARCH]', e.message);
+    res.json({ ok: false, error: e.message });
+  }
+});
+
 // ══════════════════════════════════════════════
 //  SOCKET.IO
 // ══════════════════════════════════════════════
 io.on('connection', socket => {
   console.log('[WS] Conexion: ' + socket.id);
 
-  // JOIN
+  // ── JOIN ───────────────────────────────────
   socket.on('join', ({ username, photo }) => {
     if (!username) return;
     cancelGC();
@@ -178,11 +214,7 @@ io.on('connection', socket => {
     if (!db.room.roomOwner) db.room.roomOwner = username;
 
     socket.join('room');
-
-    // Estado completo al recien llegado
     socket.emit('room-state', roomPublicState());
-
-    // Avisar a todos
     io.to('room').emit('user-joined', {
       username,
       onlineUsers : db.room.onlineUsers,
@@ -190,7 +222,6 @@ io.on('connection', socket => {
       roomOwner   : db.room.roomOwner,
     });
 
-    // Si hay video en curso, sincronizar al recien llegado (v3)
     if (db.room.currentMedia && db.room.isPlaying) {
       socket.emit('sync-position', {
         time     : db.room.currentTime,
@@ -198,23 +229,38 @@ io.on('connection', socket => {
         media    : db.room.currentMedia,
       });
     }
-
     console.log('[ROOM] ' + username + ' entro (online: ' + db.room.onlineUsers.length + ')');
   });
 
-  // LEAVE
+  // ── LEAVE ──────────────────────────────────
   socket.on('leave', ({ username }) => _userLeft(socket, username));
 
-  // CHAT
-  socket.on('chat', ({ username, text, photo }) => {
+  // ── CHAT TEXTO ─────────────────────────────
+  socket.on('chat', ({ username, text, photo, messageId }) => {
     if (!username || !text) return;
-    const msg = { username, text, photo, time: Date.now() };
+    const msg = { username, text, photo, time: Date.now(), messageId };
     db.room.messages.push(msg);
     if (db.room.messages.length > 100) db.room.messages.shift();
     io.to('room').emit('chat', msg);
   });
 
-  // PLAY
+  // ── NUEVO: Chat con imagen ─────────────────
+  socket.on('chat-image', ({ username, imageData, photo }) => {
+    if (!username || !imageData) return;
+    const msg = { username, type: 'image', imageData, photo, time: Date.now() };
+    db.room.messages.push(msg);
+    if (db.room.messages.length > 100) db.room.messages.shift();
+    io.to('room').emit('chat', msg);
+  });
+
+  // ── NUEVO: Reacciones a mensajes ───────────
+  socket.on('react-message', ({ messageId, emoji, username }) => {
+    if (!messageId || !emoji || !username) return;
+    // Reenviar a todos en la sala (incluyendo el emisor para confirmar)
+    io.to('room').emit('message-reaction', { messageId, emoji, username });
+  });
+
+  // ── PLAY ───────────────────────────────────
   socket.on('play', ({ username, time }) => {
     if (!db.room.settings.allowBothControl && username !== db.room.roomOwner) return;
     db.room.isPlaying   = true;
@@ -222,7 +268,7 @@ io.on('connection', socket => {
     io.to('room').emit('play', { username, time: db.room.currentTime });
   });
 
-  // PAUSE
+  // ── PAUSE ──────────────────────────────────
   socket.on('pause', ({ username, time }) => {
     if (!db.room.settings.allowBothControl && username !== db.room.roomOwner) return;
     db.room.isPlaying   = false;
@@ -230,14 +276,14 @@ io.on('connection', socket => {
     io.to('room').emit('pause', { username, time: db.room.currentTime });
   });
 
-  // SEEK
+  // ── SEEK ───────────────────────────────────
   socket.on('seek', ({ username, time }) => {
     if (!db.room.settings.allowBothControl && username !== db.room.roomOwner) return;
     db.room.currentTime = time;
     io.to('room').emit('seek', { username, time });
   });
 
-  // HEARTBEAT + CATCH-UP (del v3)
+  // ── HEARTBEAT + CATCH-UP ───────────────────
   socket.on('heartbeat', ({ username, time, duration }) => {
     if (username !== db.room.roomOwner) return;
     db.room.currentTime     = time;
@@ -256,7 +302,7 @@ io.on('connection', socket => {
     });
   });
 
-  // LOAD MEDIA
+  // ── LOAD MEDIA ─────────────────────────────
   socket.on('load-media', ({ username, media }) => {
     db.room.currentMedia  = media;
     db.room.isPlaying     = false;
@@ -264,20 +310,20 @@ io.on('connection', socket => {
     io.to('room').emit('load-media', { username, media });
   });
 
-  // UPDATE QUEUE
+  // ── UPDATE QUEUE ───────────────────────────
   socket.on('update-queue', ({ queue }) => {
     db.room.queue = queue;
     io.to('room').emit('update-queue', { queue });
   });
 
-  // UPDATE SETTINGS
+  // ── UPDATE SETTINGS ────────────────────────
   socket.on('update-settings', ({ username, settings }) => {
     if (username !== db.room.roomOwner) return;
     db.room.settings = { ...db.room.settings, ...settings };
     io.to('room').emit('update-settings', { settings: db.room.settings });
   });
 
-  // TRANSFER HOST (del v3)
+  // ── TRANSFER HOST ──────────────────────────
   socket.on('transfer-host', ({ username, newOwner }) => {
     if (username !== db.room.roomOwner) return;
     if (!db.room.onlineUsers.includes(newOwner)) return;
@@ -286,11 +332,11 @@ io.on('connection', socket => {
     console.log('[HOST] Nuevo host: ' + newOwner);
   });
 
-  // MIC
+  // ── MIC ────────────────────────────────────
   socket.on('mic-on',  ({ username }) => io.to('room').emit('mic-on',  { username }));
   socket.on('mic-off', ({ username }) => io.to('room').emit('mic-off', { username }));
 
-  // BUSQUEDA YOUTUBE (del v3)
+  // ── BUSQUEDA YOUTUBE v3 ────────────────────
   socket.on('search-yt', async ({ query }) => {
     if (!query) return;
     try {
@@ -301,7 +347,7 @@ io.on('connection', socket => {
     }
   });
 
-  // DISCONNECT
+  // ── DISCONNECT ─────────────────────────────
   socket.on('disconnect', () => {
     const username = socketUsers[socket.id];
     if (username) { delete socketUsers[socket.id]; _userLeft(socket, username); }
@@ -332,8 +378,7 @@ function _userLeft(socket, username) {
 }
 
 // ══════════════════════════════════════════════
-//  RELOJ INTERNO — avanza currentTime mientras
-//  hay reproduccion activa
+//  RELOJ INTERNO
 // ══════════════════════════════════════════════
 setInterval(() => {
   if (db.room.isPlaying) db.room.currentTime += 5;
