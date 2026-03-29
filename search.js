@@ -1,10 +1,6 @@
 // server/search.js - Módulo de búsqueda con Google API
 const axios = require('axios');
 
-// ⚠️ CONFIGURACIÓN: Reemplaza con tus credenciales
-const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyChMGXSV-mxLljG4JzTQU_O2BpT8FaJvD4';
-const SEARCH_ENGINE_ID = process.env.SEARCH_ENGINE_ID || '52a375b6e10d14cbe';
-
 /**
  * Busca contenido usando Google Programmable Search Engine
  * @param {string} query - Término de búsqueda
